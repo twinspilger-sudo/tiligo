@@ -72,6 +72,10 @@ async function handleEvent(event: Stripe.Event) {
   const { customer: customerId } = stripeData;
 
   if (!customerId || typeof customerId !== 'string') {
+    // For events that don't have a customer ID (e.g., some payment_intent events),
+    // we might not need to sync subscription status.
+    // Log and return if customerId is missing for relevant events.
+    console.warn(`No customer ID found for event type ${event.type}`);
     console.error(`No customer received on event: ${JSON.stringify(event)}`);
   } else {
     let isSubscription = true;
@@ -82,6 +86,17 @@ async function handleEvent(event: Stripe.Event) {
       isSubscription = mode === 'subscription';
 
       console.info(`Processing ${isSubscription ? 'subscription' : 'one-time payment'} checkout session`);
+
+      // If it's a subscription and completed, mark user as subscribed in profiles table
+      if (isSubscription) {
+        const { data: customerMapping } = await supabase.from('stripe_customers').select('user_id').eq('customer_id', customerId).single();
+        if (customerMapping?.user_id) {
+          await supabase.from('profiles').update({ is_subscribed: true }).eq('id', customerMapping.user_id);
+          console.info(`User ${customerMapping.user_id} marked as subscribed.`);
+        } else {
+          console.warn(`User ID not found for customer ${customerId} to update profile.`);
+        }
+      }
     }
 
     const { mode, payment_status } = stripeData as Stripe.Checkout.Session;
@@ -89,6 +104,17 @@ async function handleEvent(event: Stripe.Event) {
     if (isSubscription) {
       console.info(`Starting subscription sync for customer: ${customerId}`);
       await syncCustomerFromStripe(customerId);
+
+      // Update is_subscribed based on the synced subscription status
+      const { data: customerMapping } = await supabase.from('stripe_customers').select('user_id').eq('customer_id', customerId).single();
+      if (customerMapping?.user_id) {
+        const { data: subscriptionData } = await supabase.from('stripe_subscriptions').select('status').eq('customer_id', customerId).single();
+        const newIsSubscribed = subscriptionData?.status === 'active' || subscriptionData?.status === 'trialing';
+        await supabase.from('profiles').update({ is_subscribed: newIsSubscribed }).eq('id', customerMapping.user_id);
+        console.info(`User ${customerMapping.user_id} is_subscribed set to ${newIsSubscribed}.`);
+      } else {
+        console.warn(`User ID not found for customer ${customerId} to update profile after sync.`);
+      }
     } else if (mode === 'payment' && payment_status === 'paid') {
       try {
         // Extract the necessary information from the session
@@ -120,6 +146,20 @@ async function handleEvent(event: Stripe.Event) {
       } catch (error) {
         console.error('Error processing one-time payment:', error);
       }
+    } else if (event.type === 'customer.subscription.deleted' || (isSubscription && (stripeData as Stripe.Subscription).status === 'canceled' || (stripeData as Stripe.Subscription).status === 'unpaid')) {
+      // Handle subscription cancellation/deletion
+      console.info(`Subscription for customer ${customerId} was deleted or canceled. Marking user as unsubscribed.`);
+      const { data: customerMapping } = await supabase.from('stripe_customers').select('user_id').eq('customer_id', customerId).single();
+      if (customerMapping?.user_id) {
+        await supabase.from('profiles').update({ is_subscribed: false }).eq('id', customerMapping.user_id);
+        console.info(`User ${customerMapping.user_id} marked as unsubscribed.`);
+      } else {
+        console.warn(`User ID not found for customer ${customerId} to mark as unsubscribed.`);
+      }
+    } else {
+      console.info(`Unhandled event type or status: ${event.type}, isSubscription: ${isSubscription}, payment_status: ${payment_status}, subscription_status: ${(stripeData as Stripe.Subscription).status}`);
+
+
     }
   }
 }
